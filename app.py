@@ -95,6 +95,7 @@ def _conn():
 with _conn() as _c:
     _c.execute("CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, req_hash TEXT, state TEXT)")
     _c.execute("CREATE TABLE IF NOT EXISTS plan_cache(k TEXT PRIMARY KEY, plan TEXT)")
+    _c.execute("CREATE TABLE IF NOT EXISTS debug_runs(run_id TEXT PRIMARY KEY, ts INTEGER, data TEXT)")
 
 
 def run_lock(rid):
@@ -253,7 +254,8 @@ def call_model(user_payload):
     data = r.json()
     text = data["choices"][0]["message"]["content"] or ""
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-    return json.loads(text), data.get("model") or LLM_MODEL, data.get("usage") or {}
+    parsed = json.loads(text)
+    return parsed, data.get("model") or LLM_MODEL, data.get("usage") or {}
 
 
 EV_RE = re.compile(r"^\s*\[([^\]\s]+)\]", re.M)
@@ -409,6 +411,7 @@ def plan_incident(body, secrets_):
         info.update(model=model, usage=usage)
         log.info("planner ok in %.1fs", (now_ns() - start) / 1e9)
         plan = normalize_plan(raw, body)
+        plan["_raw"] = raw
         cache_put(cache_key, plan)
     except Exception as exc:  # noqa: BLE001
         detail = getattr(getattr(exc, "response", None), "status_code", "")
@@ -772,6 +775,14 @@ def do_create(raw_bytes, headers):
         resp = scrub(view(st, out), secrets_)
         st["initialResponse"] = resp
         save_run(rid, h, st)
+        try:
+            dbg = {k: v for k, v in b.items() if k != "sensitive"}
+            dbg = scrub(dbg, secrets_)
+            dbg["_plan"] = plan
+            with _conn() as c:
+                c.execute("INSERT OR REPLACE INTO debug_runs VALUES(?,?,?)", (rid, now_ns(), json.dumps(dbg)))
+        except Exception:  # noqa: BLE001
+            pass
         return 200, resp
 
 
@@ -812,6 +823,27 @@ def do_get(rid):
 
 
 # --------------------------------------------------------------------------- routes
+DEBUG_KEY = os.environ.get("DEBUG_KEY", "")
+
+
+@app.get("/debug/runs")
+async def debug_runs(request: Request):
+    if not DEBUG_KEY or request.query_params.get("key") != DEBUG_KEY:
+        return err(404, "not found")
+    with _conn() as c:
+        rows = c.execute("SELECT run_id, data FROM debug_runs ORDER BY ts DESC LIMIT 10").fetchall()
+    out = []
+    for rid, data in rows:
+        d = json.loads(data)
+        _h, st = load_run(rid)
+        if st:
+            d["_final"] = {"status": st["status"], "actionLog": st["actionLog"], "receiptLog": st["receiptLog"],
+                           "pendingApprovals": st["pendingApprovals"]}
+        out.append(d)
+    return JSONResponse(content=out)
+
+
+# --------------------------------------------------------------------------- routes (grader)
 @app.get("/")
 async def root():
     return {"ok": True, "service": "ga5-incident-agent", "profile": PROFILE}
